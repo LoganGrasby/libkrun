@@ -78,6 +78,9 @@ pub struct MmioTransport {
     queue_config: Vec<QueueConfig>,
     shm_region_select: u32,
     interrupt: InterruptTransport,
+    // Interrupt status restored from a checkpoint, raised once the vCPUs'
+    // interrupt state is restored too.
+    restored_interrupt_status: u32,
 }
 
 struct InterruptTransportInner {
@@ -144,6 +147,12 @@ impl InterruptTransport {
         Ok(())
     }
 
+    /// Raise `status` again on a device restored from a checkpoint, in which the
+    /// guest had not acknowledged it yet. See [`MmioTransport::replay_restored_interrupt`].
+    fn replay(&self, status: u32) -> Result<(), crate::Error> {
+        self.try_signal(status)
+    }
+
     pub fn try_signal_used_queue(&self) -> Result<(), crate::Error> {
         debug!(target: &self.0.log_target, "interrupt: signal_used_queue");
         self.try_signal(VIRTIO_MMIO_INT_VRING)
@@ -198,6 +207,7 @@ impl MmioTransport {
             queue_evts,
             queue_config,
             shm_region_select: 0,
+            restored_interrupt_status: 0,
         })
     }
 
@@ -226,6 +236,42 @@ impl MmioTransport {
 
     pub fn interrupt_evt(&self) -> &EventFd {
         self.interrupt.event()
+    }
+
+    /// Interrupt status the device has raised and the guest has not yet
+    /// acknowledged (`VIRTIO_MMIO_INT_*` bits), for a checkpoint.
+    pub fn interrupt_status(&self) -> u32 {
+        self.interrupt.status().load(Ordering::SeqCst) as u32
+    }
+
+    /// Remember the interrupt status of the device when it was checkpointed, to
+    /// raise it again with [`Self::replay_restored_interrupt`].
+    pub fn set_restored_interrupt_status(&mut self, status: u32) {
+        self.restored_interrupt_status = status;
+    }
+
+    /// Raise the interrupt a restored device had pending when it was checkpointed.
+    ///
+    /// The status register is not guest memory: a fresh transport starts with
+    /// none pending, so a guest that takes the interrupt it had pending reads an
+    /// empty status and ignores it. And the interrupt itself may be missing from
+    /// the checkpoint: a device raises it through an irqfd, which KVM injects
+    /// asynchronously, so a completion the device posted while it was drained
+    /// for the checkpoint can reach the interrupt controller only after the
+    /// vCPUs' state was saved. Either way the guest never sees that completion,
+    /// and with VIRTIO_RING_F_EVENT_IDX the device then signals nothing more, as
+    /// the guest's used event never advances: every later request hangs too.
+    ///
+    /// Call after the vCPUs' state is restored: restoring it replaces the local
+    /// APIC state, including an interrupt injected before. A guest that had
+    /// already taken the interrupt sees a spurious one and ignores it.
+    pub fn replay_restored_interrupt(&mut self) {
+        let status = std::mem::take(&mut self.restored_interrupt_status);
+        if status != 0
+            && let Err(error) = self.interrupt.replay(status)
+        {
+            error!("failed to raise a restored device's pending interrupt: {error:?}");
+        }
     }
 
     pub fn locked_device(&self) -> MutexGuard<'_, dyn VirtioDevice + 'static> {
@@ -1034,6 +1080,36 @@ pub(crate) mod tests {
                 | device_status::DRIVER_OK
         );
         assert!(d.locked_device().is_activated());
+    }
+
+    #[test]
+    fn restored_interrupt_is_raised_again_once() {
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let mut d = MmioTransport::new(
+            m,
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(DummyDevice::new())),
+        )
+        .unwrap();
+
+        // Nothing was pending at the checkpoint: nothing is raised.
+        d.replay_restored_interrupt();
+        assert_eq!(d.interrupt_status(), 0);
+
+        d.set_restored_interrupt_status(VIRTIO_MMIO_INT_VRING);
+        d.replay_restored_interrupt();
+        assert_eq!(d.interrupt_status(), VIRTIO_MMIO_INT_VRING);
+
+        // The guest acknowledges it; a later replay does not raise it again.
+        d.device_status = device_status::ACKNOWLEDGE
+            | device_status::DRIVER
+            | device_status::FEATURES_OK
+            | device_status::DRIVER_OK;
+        let mut buf = [0; 4];
+        write_le_u32(&mut buf[..], VIRTIO_MMIO_INT_VRING);
+        d.write(0, 0x64, &buf[..]);
+        d.replay_restored_interrupt();
+        assert_eq!(d.interrupt_status(), 0);
     }
 
     #[test]

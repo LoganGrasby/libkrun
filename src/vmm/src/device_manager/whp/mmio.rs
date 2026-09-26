@@ -203,7 +203,10 @@ impl MMIODeviceManager {
                 snapshots.push(snap);
             }
         }
-        VmDevicesState { devices: snapshots }
+        VmDevicesState {
+            devices: snapshots,
+            interrupt_status: Vec::new(),
+        }
     }
 
     /// Re-activate devices on a freshly-built clone from a checkpoint.
