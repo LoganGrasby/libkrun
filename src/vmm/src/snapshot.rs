@@ -3176,6 +3176,84 @@ pub fn memfd_region_descs(mem: &GuestMemoryMmap) -> Vec<MemfdRegionDesc> {
         .collect()
 }
 
+/// Map anonymous memory over the never-written parts of a copy-on-write view
+/// of a fork source's RAM file.
+///
+/// Touching a hole of a shared-memory file through a `MAP_PRIVATE` view, even
+/// to read it, allocates a zeroed page in the file before the clone gets its
+/// own copy. A clone that uses fresh memory would so fill its source's RAM file
+/// towards the full guest size, charged to the source, and pay several times
+/// the cost of an anonymous fault for each such page. The source is a sealed
+/// generation, so its holes read as zeros for good: anonymous memory there
+/// reads the same, and stays private to the clone. Past `MAX_OVERLAYS` holes
+/// the rest keep the file mapping, which bounds the number of mappings.
+#[cfg(target_os = "linux")]
+fn map_anonymous_over_holes(
+    host: *mut libc::c_void,
+    len: usize,
+    file: &File,
+    offset: u64,
+) -> io::Result<()> {
+    const PAGE: u64 = 4096;
+    const MAX_OVERLAYS: usize = 1024;
+    let fd = file.as_raw_fd();
+    let end = offset + len as u64;
+    let mut cursor = offset;
+    let mut overlays = 0;
+    while cursor < end && overlays < MAX_OVERLAYS {
+        let hole = unsafe { libc::lseek(fd, cursor as libc::off_t, libc::SEEK_HOLE) };
+        if hole < 0 {
+            let error = io::Error::last_os_error();
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL) | Some(libc::ENOTSUP) | Some(libc::ENXIO)
+            ) {
+                // No hole information: the file mapping stays as it is.
+                return Ok(());
+            }
+            return Err(error);
+        }
+        let hole = hole as u64;
+        if hole >= end {
+            break;
+        }
+        let data = unsafe { libc::lseek(fd, hole as libc::off_t, libc::SEEK_DATA) };
+        let data = if data < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ENXIO) {
+                return Err(error);
+            }
+            end
+        } else {
+            (data as u64).min(end)
+        };
+        let from = hole.next_multiple_of(PAGE);
+        let to = data - data % PAGE;
+        if to > from {
+            let address = unsafe { host.cast::<u8>().add((from - offset) as usize) };
+            let mapped = unsafe {
+                libc::mmap(
+                    address.cast(),
+                    (to - from) as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                    -1,
+                    0,
+                )
+            };
+            if mapped == libc::MAP_FAILED {
+                return Err(io::Error::last_os_error());
+            }
+            // Keep the page size a CoW copy of the file would have, so a
+            // clone's memory use does not change with where it writes.
+            unsafe { libc::madvise(mapped, (to - from) as usize, libc::MADV_NOHUGEPAGE) };
+            overlays += 1;
+        }
+        cursor = data;
+    }
+    Ok(())
+}
+
 /// Build a clone's guest memory as a CoW view of another process's memfd-backed
 /// RAM: for each descriptor, open `/proc/<owner_pid>/fd/<fd>` and
 /// `mmap(MAP_PRIVATE)` it (clean pages shared with the frozen owner → density;
@@ -3230,6 +3308,12 @@ pub fn open_cow_memory_from_pid_with_backing(
                     d.offset as libc::off_t,
                 )
             };
+            if ptr != libc::MAP_FAILED
+                && let Err(error) = map_anonymous_over_holes(ptr, size, &file, d.offset)
+            {
+                unsafe { libc::munmap(ptr, size) };
+                return Err(io_err(format!("map holes of {path}: {error}")));
+            }
             backing.push(Some((file, d.offset)));
             (ptr, flags)
         } else {
@@ -4208,6 +4292,62 @@ mod tests {
         expected[9 * PAGE..10 * PAGE].fill(0x44);
         expected[SIZE + 2 * PAGE..SIZE + 3 * PAGE].fill(0x55);
         assert!(image == expected, "held save image differs from the clone");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clone_use_of_source_holes_does_not_allocate_them() {
+        use crate::builder::create_guest_ram_memfd;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        const PAGE: usize = 4096;
+        const SIZE: usize = 8 * 1024 * 1024;
+        let source = create_guest_ram_memfd(SIZE).unwrap();
+        // Data, a hole, data, then a large hole.
+        source.write_all_at(&[0x11; 2 * PAGE], 0).unwrap();
+        source.write_all_at(&[0x33; PAGE], 4 * PAGE as u64).unwrap();
+        let allocated = source.metadata().unwrap().blocks();
+        let descs = [MemfdRegionDesc {
+            gpa: 0,
+            len: SIZE as u64,
+            fd: source.as_raw_fd(),
+            offset: 0,
+            path: String::new(),
+        }];
+        let clone = open_cow_memory_from_pid(std::process::id() as i32, &descs).unwrap();
+
+        let mut image = vec![0_u8; SIZE];
+        clone.read_slice(&mut image, GuestAddress(0)).unwrap();
+        let mut expected = vec![0_u8; SIZE];
+        expected[..2 * PAGE].fill(0x11);
+        expected[4 * PAGE..5 * PAGE].fill(0x33);
+        assert!(
+            image == expected,
+            "the clone reads different memory than its source"
+        );
+
+        let fresh = vec![0x44_u8; SIZE - 5 * PAGE];
+        clone
+            .write_slice(&fresh, GuestAddress(5 * PAGE as u64))
+            .unwrap();
+        clone
+            .write_slice(&[0x55; PAGE], GuestAddress(PAGE as u64))
+            .unwrap();
+        clone.read_slice(&mut image, GuestAddress(0)).unwrap();
+        expected[5 * PAGE..].fill(0x44);
+        expected[PAGE..2 * PAGE].fill(0x55);
+        assert!(image == expected, "the clone lost its own writes");
+        assert_eq!(
+            source.metadata().unwrap().blocks(),
+            allocated,
+            "the clone allocated unwritten pages of its source's RAM file"
+        );
+        let mut data = vec![0_u8; 5 * PAGE];
+        source.read_exact_at(&mut data, 0).unwrap();
+        assert!(data[..PAGE].iter().all(|&byte| byte == 0x11));
+        assert!(data[PAGE..2 * PAGE].iter().all(|&byte| byte == 0x11));
+        assert!(data[4 * PAGE..].iter().all(|&byte| byte == 0x33));
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
