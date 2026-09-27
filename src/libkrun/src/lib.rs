@@ -802,7 +802,7 @@ fn handle_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
 /// source is paused. The caller stages disk state, resumes the VM, and then
 /// sends `FINISH_SAVE` to write the retained generation.
 #[cfg(all(snapshot_supported, deferred_stream_supported))]
-fn handle_prepare_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
+fn handle_prepare_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str, held: bool) -> String {
     if dir.is_empty() {
         return "ERR EINVAL snapshot dir required\n".to_string();
     }
@@ -814,11 +814,15 @@ fn handle_prepare_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
         return format!("ERR EIO create {}: {error}\n", dir_path.display());
     }
 
-    let (checkpoint, memory) = match vmm
-        .lock()
-        .unwrap()
-        .checkpoint_frozen_deferred_sparse(&dir_path)
-    {
+    let capture = {
+        let mut vmm = vmm.lock().unwrap();
+        if held {
+            vmm.checkpoint_frozen_held_sparse(&dir_path)
+        } else {
+            vmm.checkpoint_frozen_deferred_sparse(&dir_path)
+        }
+    };
+    let (checkpoint, memory) = match capture {
         Ok(capture) => capture,
         Err(error) => {
             let _ = std::fs::remove_dir_all(&dir_path);
@@ -1519,6 +1523,8 @@ fn build_restore_ctx_with_memory_mode(
             fork_backed_regions: vec![true; count],
             checkpoint,
             portable_clock: false,
+            #[cfg(target_os = "linux")]
+            cow_backing: Vec::new(),
         });
     }
     if magic == PORTABLE_MANIFEST_MAGIC {
@@ -1599,6 +1605,8 @@ fn build_restore_ctx_with_memory_mode(
             fork_backed_regions: vec![true; descs.len()],
             checkpoint,
             portable_clock: true,
+            #[cfg(target_os = "linux")]
+            cow_backing: Vec::new(),
         });
     }
     #[cfg(target_os = "linux")]
@@ -1628,6 +1636,8 @@ fn build_restore_ctx_with_memory_mode(
             fork_backed_regions: vec![true; desc.regions.len()],
             checkpoint,
             portable_clock: false,
+            #[cfg(target_os = "linux")]
+            cow_backing: Vec::new(),
         });
     }
     if magic != FORK_MANIFEST_MAGIC {
@@ -1638,8 +1648,9 @@ fn build_restore_ctx_with_memory_mode(
     let checkpoint =
         std::fs::read(dir.join("checkpoint.bin")).map_err(|e| format!("checkpoint: {e}"))?;
     #[cfg(target_os = "linux")]
-    let guest_memory = vmm::snapshot::open_cow_memory_from_pid(_owner_pid, &descs)
-        .map_err(|e| format!("cow-map guest memory: {e}"))?;
+    let (guest_memory, cow_backing) =
+        vmm::snapshot::open_cow_memory_from_pid_with_backing(_owner_pid, &descs)
+            .map_err(|e| format!("cow-map guest memory: {e}"))?;
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     let guest_memory = vmm::snapshot::open_cow_memory_from_paths(&descs)
         .map_err(|e| format!("cow-map guest memory: {e}"))?;
@@ -1655,6 +1666,8 @@ fn build_restore_ctx_with_memory_mode(
             .collect(),
         checkpoint,
         portable_clock: false,
+        #[cfg(target_os = "linux")]
+        cow_backing,
     })
 }
 
@@ -1764,8 +1777,11 @@ fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
                 // After RESUME, FINISH_SAVE persists that retained generation;
                 // CANCEL_SAVE releases it after a caller-side failure.
                 #[cfg(all(snapshot_supported, deferred_stream_supported))]
-                "PREPARE_SAVE" => {
-                    let response = handle_prepare_save(vmm, _arg);
+                // PREPARE_SAVE_HELD is PREPARE_SAVE for a caller that keeps
+                // the VM paused until FINISH_SAVE* and then stops it, so RAM
+                // that cannot be retained as a generation is read in place.
+                "PREPARE_SAVE" | "PREPARE_SAVE_HELD" => {
+                    let response = handle_prepare_save(vmm, _arg, verb == "PREPARE_SAVE_HELD");
                     if let Err(error) = write_prepared_save_reply(&mut stream, &response, || {
                         // The control listener is serial: no later command can
                         // consume this preparation before reply delivery ends.

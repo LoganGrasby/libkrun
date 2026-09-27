@@ -608,6 +608,10 @@ pub struct RestoreCtx {
     /// fork manifests use a same-host compatibility path on KVM versions that
     /// do not expose realtime/host-TSC samples.
     pub portable_clock: bool,
+    /// Per region, the file a copy-on-write clone region maps and the offset
+    /// in it (empty when the memory is not such a view).
+    #[cfg(target_os = "linux")]
+    pub cow_backing: Vec<Option<(std::fs::File, u64)>>,
 }
 
 /// Typed backing ownership accompanies restored mappings through RAM setup.
@@ -647,6 +651,7 @@ pub fn build_microvm(
         restore_demand_pager,
         restore_layered_ram,
         restore_portable_clock,
+        restore_cow_backing,
     ) = match restore {
         Some(RestoreCtx {
             demand_pager,
@@ -655,6 +660,7 @@ pub fn build_microvm(
             fork_backed_regions,
             checkpoint,
             portable_clock,
+            cow_backing,
         }) => (
             Some(RestoredMemory {
                 guest_memory,
@@ -665,8 +671,9 @@ pub fn build_microvm(
             demand_pager,
             layered_ram,
             portable_clock,
+            cow_backing,
         ),
-        None => (None, None, None, None, false),
+        None => (None, None, None, None, false, Vec::new()),
     };
     #[cfg(not(target_os = "linux"))]
     let (restore_mem, restore_checkpoint, restore_portable_clock) = match restore {
@@ -1183,6 +1190,10 @@ pub fn build_microvm(
         exit_code: exit_code.clone(),
         #[cfg(all(target_os = "linux", fork_continue_supported, feature = "blk"))]
         retained_generation_files: Vec::new(),
+        #[cfg(target_os = "linux")]
+        cow_backing: restore_cow_backing,
+        #[cfg(target_os = "linux")]
+        held_save_valid: None,
         vm,
         mmio_device_manager,
         #[cfg(not(feature = "tee"))]
