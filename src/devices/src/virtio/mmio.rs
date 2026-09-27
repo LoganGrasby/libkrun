@@ -148,9 +148,21 @@ impl InterruptTransport {
     }
 
     /// Raise `status` again on a device restored from a checkpoint, in which the
-    /// guest had not acknowledged it yet. See [`MmioTransport::replay_restored_interrupt`].
+    /// guest had not acknowledged it yet, together with anything the device
+    /// raised while it was restored. See [`MmioTransport::replay_restored_interrupt`].
+    ///
+    /// Unlike [`Self::try_signal`] this raises the line even for a bit that is
+    /// already set: an interrupt raised during restore was dropped when the
+    /// vCPUs' state replaced it, but its status bit stayed set.
     fn replay(&self, status: u32) -> Result<(), crate::Error> {
-        self.try_signal(status)
+        let pending = self.status().fetch_or(status as usize, Ordering::SeqCst) | status as usize;
+        if pending != 0 {
+            self.intc()
+                .lock()
+                .unwrap()
+                .set_irq(self.0.irq_line, Some(&self.0.event))?;
+        }
+        Ok(())
     }
 
     pub fn try_signal_used_queue(&self) -> Result<(), crate::Error> {
@@ -262,14 +274,17 @@ impl MmioTransport {
     /// and with VIRTIO_RING_F_EVENT_IDX the device then signals nothing more, as
     /// the guest's used event never advances: every later request hangs too.
     ///
+    /// A device can also raise an interrupt while it is restored, before the
+    /// vCPUs' state is: vsock tells the guest its connections are gone. That
+    /// interrupt is lost the same way, and its status bit stays set, so the
+    /// device would never raise the line again.
+    ///
     /// Call after the vCPUs' state is restored: restoring it replaces the local
     /// APIC state, including an interrupt injected before. A guest that had
     /// already taken the interrupt sees a spurious one and ignores it.
     pub fn replay_restored_interrupt(&mut self) {
         let status = std::mem::take(&mut self.restored_interrupt_status);
-        if status != 0
-            && let Err(error) = self.interrupt.replay(status)
-        {
+        if let Err(error) = self.interrupt.replay(status) {
             error!("failed to raise a restored device's pending interrupt: {error:?}");
         }
     }
@@ -1110,6 +1125,27 @@ pub(crate) mod tests {
         d.write(0, 0x64, &buf[..]);
         d.replay_restored_interrupt();
         assert_eq!(d.interrupt_status(), 0);
+    }
+
+    #[test]
+    fn interrupt_raised_during_restore_is_raised_again() {
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let mut d = MmioTransport::new(
+            m,
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(DummyDevice::new())),
+        )
+        .unwrap();
+
+        // Raised while the device is restored, before the vCPUs' state is.
+        d.interrupt.signal_used_queue();
+        assert_eq!(d.interrupt_evt().read().unwrap(), 1);
+
+        // Nothing was pending in the checkpoint, and the bit is already set:
+        // the line is raised again all the same.
+        d.replay_restored_interrupt();
+        assert_eq!(d.interrupt_status(), VIRTIO_MMIO_INT_VRING);
+        assert_eq!(d.interrupt_evt().read().unwrap(), 1);
     }
 
     #[test]

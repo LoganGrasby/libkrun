@@ -243,8 +243,13 @@ pub mod test_utils {
         fn set_irq(
             &self,
             _irq_line: Option<u32>,
-            _interrupt_evt: Option<&EventFd>,
+            interrupt_evt: Option<&EventFd>,
         ) -> Result<(), DeviceError> {
+            // Like an irqfd: each raise is one write to the device's eventfd.
+            if let Some(evt) = interrupt_evt {
+                evt.write(1)
+                    .map_err(DeviceError::FailedSignalingUsedQueue)?;
+            }
             Ok(())
         }
     }
