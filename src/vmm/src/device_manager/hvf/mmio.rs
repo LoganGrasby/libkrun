@@ -136,7 +136,10 @@ impl MMIODeviceManager {
                 snapshots.push(snap);
             }
         }
-        VmDevicesState { devices: snapshots }
+        VmDevicesState {
+            devices: snapshots,
+            interrupt_status: Vec::new(),
+        }
     }
 
     /// Quiesce every virtio device to a clean boundary before snapshotting.

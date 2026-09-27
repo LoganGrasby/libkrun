@@ -123,6 +123,11 @@ impl DeviceSnapshot {
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VmDevicesState {
     pub devices: Vec<DeviceSnapshot>,
+    /// Interrupt status (`VIRTIO_MMIO_INT_*` bits) that each device in `devices`
+    /// had raised and the guest had not yet acknowledged, in the same order.
+    /// Empty in checkpoints taken before it was recorded.
+    #[serde(default)]
+    pub interrupt_status: Vec<u32>,
 }
 
 impl VmDevicesState {
@@ -234,6 +239,7 @@ impl VmDevicesState {
     {
         VmDevicesState {
             devices: devices.into_iter().filter_map(snapshot_device).collect(),
+            interrupt_status: Vec::new(),
         }
     }
 }
@@ -275,6 +281,7 @@ mod tests {
                     listeners: Vec::new(),
                 }),
             ],
+            interrupt_status: vec![0, 1],
         };
 
         let bytes = state.to_bytes().expect("serialize");
@@ -296,6 +303,12 @@ mod tests {
         let old = br#"{"cid":7,"acked_features":0,"activated":true,"queue_rx":null,"queue_tx":null,"listeners":[]}"#;
         let state: VsockState = serde_json::from_slice(old).expect("deserialize");
         assert_eq!(state.queue_ev, None);
+    }
+
+    #[test]
+    fn device_state_without_interrupt_status_still_decodes() {
+        let restored = VmDevicesState::from_bytes(br#"{"devices":[]}"#).expect("deserialize");
+        assert!(restored.interrupt_status.is_empty());
     }
 
     // A GPU device carries only transport state (features + queue rings) into a
@@ -329,6 +342,7 @@ mod tests {
 
         let state = VmDevicesState {
             devices: vec![snap],
+            interrupt_status: Vec::new(),
         };
         let restored =
             VmDevicesState::from_bytes(&state.to_bytes().expect("serialize")).expect("deserialize");

@@ -331,14 +331,34 @@ impl MMIODeviceManager {
     /// [`VmDevicesState::capture`]. Iterates the device handles kept at
     /// registration; not-yet-supported device types are skipped.
     pub fn snapshot_devices(&self) -> VmDevicesState {
+        // Read each transport's status first: restore locks a transport before
+        // its device, so don't take them the other way round.
+        let status_of: Vec<_> = self
+            .mmio_transports
+            .iter()
+            .map(|transport| {
+                let transport = transport.lock().expect("poisoned transport lock");
+                (transport.device(), transport.interrupt_status())
+            })
+            .collect();
         let mut snapshots = Vec::new();
+        let mut interrupt_status = Vec::new();
         for dev in &self.virtio_devices {
             let guard = dev.lock().expect("poisoned virtio device lock");
             if let Some(snap) = snapshot_device(&*guard) {
                 snapshots.push(snap);
+                interrupt_status.push(
+                    status_of
+                        .iter()
+                        .find(|(device, _)| Arc::ptr_eq(device, dev))
+                        .map_or(0, |(_, status)| *status),
+                );
             }
         }
-        VmDevicesState { devices: snapshots }
+        VmDevicesState {
+            devices: snapshots,
+            interrupt_status,
+        }
     }
 
     /// Re-activate devices on a freshly-built clone from a checkpoint: for each
@@ -351,7 +371,7 @@ impl MMIODeviceManager {
         state: &VmDevicesState,
     ) -> std::result::Result<(), String> {
         let mut used = vec![false; self.mmio_transports.len()];
-        for snap in &state.devices {
+        for (index, snap) in state.devices.iter().enumerate() {
             let want = snap.device_type();
             let queue_states = snap.queue_states();
             let acked = snap.acked_features();
@@ -369,6 +389,9 @@ impl MMIODeviceManager {
                 // the subsequent `activate` rebuilds its worker from that state.
                 restore_device(&mut *t.locked_device(), snap)?;
                 t.restore_and_activate(&queue_states, acked)?;
+                t.set_restored_interrupt_status(
+                    state.interrupt_status.get(index).copied().unwrap_or(0),
+                );
                 // Devices that defer worker startup past `activate` (the console
                 // starts each port's worker only on the guest's PORT_OPEN, which
                 // a restored guest never re-sends) restart their workers here.
@@ -384,6 +407,18 @@ impl MMIODeviceManager {
             }
         }
         Ok(())
+    }
+
+    /// Raise the interrupts restored devices had pending at the checkpoint (see
+    /// [`devices::virtio::MmioTransport::replay_restored_interrupt`]). Call
+    /// after the vCPUs' state is restored.
+    pub fn replay_restored_interrupts(&self) {
+        for transport in &self.mmio_transports {
+            transport
+                .lock()
+                .expect("poisoned transport lock")
+                .replay_restored_interrupt();
+        }
     }
 
     /// Quiesce every virtio device to a clean boundary before snapshotting
