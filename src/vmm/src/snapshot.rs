@@ -115,50 +115,112 @@ fn next_memory_data_offset(file: &File, offset: u64) -> io::Result<Option<u64>> 
     }
 }
 
+/// Guest RAM read as a sparse stream: one region's bytes, addressed from 0.
+#[cfg(target_os = "linux")]
+trait SparseRamSource {
+    fn len(&self) -> u64;
+    /// The first offset at or after `offset` that may hold data, `None` if
+    /// none does, or `Unsupported` when the source cannot tell (scan instead).
+    fn next_data(&mut self, offset: u64) -> io::Result<Option<u64>>;
+    /// Read `buffer.len()` bytes at `offset`. Bytes that cannot hold data may
+    /// read as zero without being touched.
+    fn read_exact_at(&mut self, buffer: &mut [u8], offset: u64) -> io::Result<()>;
+}
+
+#[cfg(target_os = "linux")]
+struct FileRamSource<'a, F> {
+    file: &'a File,
+    start: u64,
+    len: u64,
+    next_data: &'a std::cell::RefCell<F>,
+}
+
+#[cfg(target_os = "linux")]
+impl<F: FnMut(&File, u64) -> io::Result<Option<u64>>> SparseRamSource for FileRamSource<'_, F> {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn next_data(&mut self, offset: u64) -> io::Result<Option<u64>> {
+        let at = self.start + offset;
+        match (self.next_data.borrow_mut())(self.file, at)? {
+            Some(data) if data < at => Err(io::Error::other("RAM data extent moved backwards")),
+            Some(data) => Ok(Some(data - self.start)),
+            None => Ok(None),
+        }
+    }
+
+    fn read_exact_at(&mut self, buffer: &mut [u8], offset: u64) -> io::Result<()> {
+        self.file.read_exact_at(buffer, self.start + offset)
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn stream_sparse_memory_files_with_seek<W: Write>(
     sources: &[(&File, u64, u64)],
     output: &mut W,
-    mut next_data: impl FnMut(&File, u64) -> io::Result<Option<u64>>,
+    next_data: impl FnMut(&File, u64) -> io::Result<Option<u64>>,
 ) -> io::Result<()> {
-    use std::os::unix::fs::FileExt;
+    for (file, start, len) in sources {
+        let end = start
+            .checked_add(*len)
+            .ok_or_else(|| io::Error::other("RAM source offset overflow"))?;
+        if end > file.metadata()?.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "RAM source is truncated",
+            ));
+        }
+    }
+    let next_data = std::cell::RefCell::new(next_data);
+    let mut files: Vec<_> = sources
+        .iter()
+        .map(|&(file, start, len)| FileRamSource {
+            file,
+            start,
+            len,
+            next_data: &next_data,
+        })
+        .collect();
+    let mut sources: Vec<&mut dyn SparseRamSource> = files
+        .iter_mut()
+        .map(|source| source as &mut dyn SparseRamSource)
+        .collect();
+    stream_sparse_ram(&mut sources, output)
+}
+
+#[cfg(target_os = "linux")]
+fn stream_sparse_ram<W: Write>(
+    sources: &mut [&mut dyn SparseRamSource],
+    output: &mut W,
+) -> io::Result<()> {
     const PAGE: usize = 4096;
     static ZERO: [u8; PAGE] = [0; PAGE];
-    let logical = sources
-        .iter()
-        .try_fold(0_u64, |total, (file, start, len)| {
-            let end = start
-                .checked_add(*len)
-                .ok_or_else(|| io::Error::other("RAM source offset overflow"))?;
-            if end > file.metadata()?.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "RAM source is truncated",
-                ));
-            }
-            total
-                .checked_add(*len)
-                .ok_or_else(|| io::Error::other("RAM stream length overflow"))
-        })?;
+    let logical = sources.iter().try_fold(0_u64, |total, source| {
+        total
+            .checked_add(source.len())
+            .ok_or_else(|| io::Error::other("RAM stream length overflow"))
+    })?;
     if logical == 0 {
         return Err(io::Error::other("empty RAM stream"));
     }
     let mut ranges: Vec<(u64, u64)> = Vec::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
     let mut base = 0;
-    for (file, start, len) in sources {
+    for source in sources.iter_mut() {
+        let len = source.len();
         let mut cursor = 0;
         let mut seek_supported = true;
-        while cursor < *len {
+        while cursor < len {
             if seek_supported {
-                match next_data(file, start + cursor) {
-                    Ok(Some(data)) if data < start + cursor => {
+                match source.next_data(cursor) {
+                    Ok(Some(data)) if data < cursor => {
                         return Err(io::Error::other("RAM data extent moved backwards"));
                     }
-                    Ok(Some(data)) if data < start + len => {
+                    Ok(Some(data)) if data < len => {
                         // Preserve the original region-relative page boundaries,
                         // including a region starting partway through a host page.
-                        cursor = (data - start) / PAGE as u64 * PAGE as u64;
+                        cursor = data / PAGE as u64 * PAGE as u64;
                     }
                     Ok(_) => break,
                     Err(error) if error.kind() == io::ErrorKind::Unsupported => {
@@ -167,8 +229,8 @@ fn stream_sparse_memory_files_with_seek<W: Write>(
                     Err(error) => return Err(error),
                 }
             }
-            let count = (*len - cursor).min(buffer.len() as u64) as usize;
-            file.read_exact_at(&mut buffer[..count], start + cursor)?;
+            let count = (len - cursor).min(buffer.len() as u64) as usize;
+            source.read_exact_at(&mut buffer[..count], cursor)?;
             for (page, bytes) in buffer[..count].chunks(PAGE).enumerate() {
                 if bytes == &ZERO[..bytes.len()] {
                     continue;
@@ -198,14 +260,14 @@ fn stream_sparse_memory_files_with_seek<W: Write>(
     }
     output.write_all(&logical.to_le_bytes())?;
     output.write_all(&0_u64.to_le_bytes())?;
-    // Sources are held open by the generation owner throughout both passes.
-    // Only immutable generations may enter here: a changing source could make
-    // the sparse map omit bytes written after its scan.
+    // Sources are held unchanged by their owner throughout both passes. Only
+    // immutable generations may enter here: a changing source could make the
+    // sparse map omit bytes written after its scan.
     let mut region = 0;
     let mut region_base = 0;
     for (mut offset, mut len) in ranges {
         while len > 0 {
-            let (file, start, region_len) = sources[region];
+            let region_len = sources[region].len();
             if offset >= region_base + region_len {
                 region_base += region_len;
                 region += 1;
@@ -214,7 +276,7 @@ fn stream_sparse_memory_files_with_seek<W: Write>(
             let count = len
                 .min(region_base + region_len - offset)
                 .min(buffer.len() as u64);
-            file.read_exact_at(&mut buffer[..count as usize], start + offset - region_base)?;
+            sources[region].read_exact_at(&mut buffer[..count as usize], offset - region_base)?;
             output.write_all(&buffer[..count as usize])?;
             offset += count;
             len -= count;
@@ -1253,6 +1315,7 @@ enum DeferredLinuxGeneration {
     },
     Copy(ForkGenerationCopy),
     Layered(crate::layered_restore::Generation),
+    Held(HeldMemory),
 }
 
 #[cfg(target_os = "linux")]
@@ -1342,6 +1405,503 @@ pub fn start_deferred_memory_save_with_windows(
     Ok(DeferredMemorySave { generation })
 }
 
+/// Guest RAM saved in place from a VM that stays paused until the save is
+/// finished or abandoned.
+///
+/// A restored fork clone's RAM is a raw `MAP_PRIVATE` view of its source's
+/// memfd, so it has no file generation to retain and the deferred save above
+/// refuses it. When the caller will stop the VM after the save instead of
+/// resuming it, nothing needs to be retained: the paused mappings are the
+/// point-in-time image. They are read without touching pages that cannot hold
+/// data: reading a never-written page of a shared-memory mapping allocates it
+/// in the source's RAM file.
+#[cfg(target_os = "linux")]
+pub struct HeldMemory {
+    /// Keeps the mappings alive while they are read.
+    _memory: GuestMemoryMmap,
+    regions: Vec<HeldRegion>,
+    pagemap: File,
+    /// Cleared when the VM resumes: its RAM is then no longer the image.
+    valid: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(target_os = "linux")]
+struct HeldRegion {
+    gpa: u64,
+    len: u64,
+    host: usize,
+    /// The file this region's clean pages come from, and where in it.
+    backing: Option<(File, u64)>,
+    device_window: bool,
+    /// What maps each part of the region, as sorted region-relative ranges.
+    segments: Vec<(u64, u64, HeldSegment)>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeldSegment {
+    /// A copy-on-write view of the region's backing file.
+    Backing,
+    /// Anonymous memory: zero until written.
+    Anonymous,
+    /// Another file mapped over guest memory, such as a DAX window mapping:
+    /// read it, as another process would.
+    OtherFile,
+}
+
+/// Split each region by the mappings `/proc/self/maps` lists over it.
+#[cfg(target_os = "linux")]
+fn held_segments(
+    maps: &str,
+    host: usize,
+    len: u64,
+    backing: Option<&File>,
+) -> io::Result<Vec<(u64, u64, HeldSegment)>> {
+    use std::os::unix::fs::MetadataExt;
+    let backing = backing
+        .map(|file| {
+            file.metadata().map(|metadata| {
+                let dev = metadata.dev();
+                (
+                    libc::major(dev) as u64,
+                    libc::minor(dev) as u64,
+                    metadata.ino(),
+                )
+            })
+        })
+        .transpose()?;
+    let start = host as u64;
+    let end = start + len;
+    let mut segments = Vec::new();
+    for line in maps.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(range), Some(_perms), Some(_offset), Some(dev), Some(inode)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            continue;
+        };
+        let parse = |value: &str| u64::from_str_radix(value, 16).ok();
+        let Some((from, to)) = range
+            .split_once('-')
+            .and_then(|(from, to)| Some((parse(from)?, parse(to)?)))
+        else {
+            continue;
+        };
+        if to <= start || from >= end {
+            continue;
+        }
+        let inode: u64 = inode.parse().unwrap_or(0);
+        let device = dev
+            .split_once(':')
+            .and_then(|(major, minor)| Some((parse(major)?, parse(minor)?)));
+        let kind = if inode == 0 {
+            HeldSegment::Anonymous
+        } else if backing
+            .is_some_and(|(major, minor, ino)| device == Some((major, minor)) && inode == ino)
+        {
+            HeldSegment::Backing
+        } else {
+            HeldSegment::OtherFile
+        };
+        segments.push((from.max(start) - start, to.min(end) - start, kind));
+    }
+    segments.sort_by_key(|segment| segment.0);
+    Ok(segments)
+}
+
+/// Start a [`HeldMemory`] save of `parent`, which must stay paused.
+/// `cow_backing` holds, per region, the file a copy-on-write view maps.
+#[cfg(target_os = "linux")]
+pub fn start_held_memory_save(
+    parent: &GuestMemoryMmap,
+    cow_backing: &[Option<(File, u64)>],
+    device_windows_from: Option<GuestAddress>,
+    valid: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> io::Result<DeferredMemorySave> {
+    if !cow_backing.is_empty() && cow_backing.len() != parent.num_regions() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "copy-on-write backing does not match guest RAM regions",
+        ));
+    }
+    let unsupported = |error: io::Error| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("deferred durable save requires a readable page map: {error}"),
+        )
+    };
+    let pagemap = open_own_pagemap().map_err(unsupported)?;
+    let maps = std::fs::read_to_string("/proc/self/maps").map_err(unsupported)?;
+    let mut regions = Vec::with_capacity(parent.num_regions());
+    for (index, region) in parent.iter().enumerate() {
+        let host = parent
+            .get_host_address(region.start_addr())
+            .map_err(|error| io::Error::other(format!("guest RAM host address: {error:?}")))?;
+        let backing = match region.file_offset() {
+            Some(file_offset) => Some((file_offset.file().try_clone()?, file_offset.start())),
+            None => match cow_backing.get(index) {
+                Some(Some((file, offset))) => Some((file.try_clone()?, *offset)),
+                _ => None,
+            },
+        };
+        let segments = held_segments(
+            &maps,
+            host as usize,
+            region.len(),
+            backing.as_ref().map(|(file, _)| file),
+        )?;
+        regions.push(HeldRegion {
+            gpa: region.start_addr().raw_value(),
+            len: region.len(),
+            host: host as usize,
+            backing,
+            device_window: device_windows_from.is_some_and(|start| region.start_addr() >= start),
+            segments,
+        });
+    }
+    if regions.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "guest RAM has no regions",
+        ));
+    }
+    Ok(DeferredMemorySave {
+        generation: DeferredLinuxGeneration::Held(HeldMemory {
+            _memory: parent.clone(),
+            regions,
+            pagemap,
+            valid,
+        }),
+    })
+}
+
+#[cfg(target_os = "linux")]
+impl HeldMemory {
+    fn ensure_valid(&self) -> io::Result<()> {
+        if self.valid.load(std::sync::atomic::Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(io::Error::other(
+                "the VM resumed before its held save finished",
+            ))
+        }
+    }
+
+    fn descs(&self) -> Vec<MemoryRegionDesc> {
+        self.regions
+            .iter()
+            .map(|region| MemoryRegionDesc {
+                gpa: region.gpa,
+                len: region.len,
+            })
+            .collect()
+    }
+
+    fn sources(&self) -> io::Result<Vec<HeldRamSource<'_>>> {
+        self.regions
+            .iter()
+            .map(|region| {
+                Ok(HeldRamSource {
+                    region,
+                    pagemap: self.pagemap.try_clone()?,
+                    segment: 0,
+                    window: vec![0; HELD_PAGEMAP_WINDOW],
+                    window_start: 0,
+                    window_len: 0,
+                    hole_from: 0,
+                    data_start: 0,
+                    data_end: 0,
+                    extents_known: false,
+                })
+            })
+            .collect()
+    }
+
+    fn stream<W: Write>(&self, output: &mut W) -> io::Result<()> {
+        self.ensure_valid()?;
+        let mut sources = self.sources()?;
+        let mut sources: Vec<&mut dyn SparseRamSource> = sources
+            .iter_mut()
+            .map(|source| source as &mut dyn SparseRamSource)
+            .collect();
+        stream_sparse_ram(&mut sources, output)?;
+        self.ensure_valid()
+    }
+
+    /// Write every region in full, in order.
+    fn stream_full<W: Write>(&self, output: &mut W) -> io::Result<()> {
+        self.ensure_valid()?;
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        for mut source in self.sources()? {
+            let mut offset = 0;
+            while offset < source.region.len {
+                let count = (source.region.len - offset).min(buffer.len() as u64) as usize;
+                source.read_exact_at(&mut buffer[..count], offset)?;
+                output.write_all(&buffer[..count])?;
+                offset += count as u64;
+            }
+        }
+        self.ensure_valid()
+    }
+
+    /// Write the image to `output` as a sparse file in region order.
+    fn write_sparse_to(&self, output: &mut File) -> io::Result<()> {
+        const PAGE: usize = 4096;
+        static ZERO: [u8; PAGE] = [0; PAGE];
+        self.ensure_valid()?;
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        let mut base = 0_u64;
+        for mut source in self.sources()? {
+            let len = source.region.len;
+            let mut cursor = 0;
+            while cursor < len {
+                match source.next_data(cursor)? {
+                    Some(data) if data < len => cursor = data / PAGE as u64 * PAGE as u64,
+                    _ => break,
+                }
+                let count = (len - cursor).min(buffer.len() as u64) as usize;
+                source.read_exact_at(&mut buffer[..count], cursor)?;
+                for (page, bytes) in buffer[..count].chunks(PAGE).enumerate() {
+                    if bytes != &ZERO[..bytes.len()] {
+                        output.write_all_at(bytes, base + cursor + (page * PAGE) as u64)?;
+                    }
+                }
+                cursor += count as u64;
+            }
+            base = base
+                .checked_add(len)
+                .ok_or_else(|| io::Error::other("memory image too large"))?;
+        }
+        output.set_len(base)?;
+        output.seek(SeekFrom::Start(base))?;
+        self.ensure_valid()
+    }
+}
+
+/// This process's page map. A non-dumpable process cannot open its own, so
+/// the embedder may open it before hardening and pass the descriptor in
+/// `KRUN_PAGEMAP_FD`.
+#[cfg(target_os = "linux")]
+fn open_own_pagemap() -> io::Result<File> {
+    use std::os::fd::{BorrowedFd, FromRawFd};
+    match File::open("/proc/self/pagemap") {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            let Some(fd) = std::env::var("KRUN_PAGEMAP_FD")
+                .ok()
+                .and_then(|fd| fd.parse::<libc::c_int>().ok())
+                .filter(|&fd| fd > 2)
+            else {
+                return Err(error);
+            };
+            // SAFETY: the embedder opened `fd` for this purpose and keeps it
+            // open for the life of the process; it is only borrowed to dup.
+            let owned = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;
+            Ok(unsafe { File::from_raw_fd(std::os::fd::IntoRawFd::into_raw_fd(owned)) })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+const HELD_PAGEMAP_WINDOW: usize = 512;
+
+#[cfg(target_os = "linux")]
+struct HeldRamSource<'a> {
+    region: &'a HeldRegion,
+    pagemap: File,
+    /// Index of the segment the last lookup found.
+    segment: usize,
+    /// Pagemap entries for `window_len` pages from page `window_start`.
+    window: Vec<u64>,
+    window_start: u64,
+    window_len: u64,
+    /// The backing file's data extent at or after `hole_from`.
+    hole_from: u64,
+    data_start: u64,
+    data_end: u64,
+    extents_known: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl HeldRamSource<'_> {
+    const PAGE: u64 = 4096;
+
+    /// What maps the page at `offset`; `OtherFile` when nothing does.
+    fn segment_at(&mut self, offset: u64) -> HeldSegment {
+        let segments = &self.region.segments;
+        if self.segment >= segments.len() || segments[self.segment].0 > offset {
+            self.segment = 0;
+        }
+        while self.segment < segments.len() {
+            let (from, to, kind) = segments[self.segment];
+            if offset < from {
+                break;
+            }
+            if offset < to {
+                return kind;
+            }
+            self.segment += 1;
+        }
+        HeldSegment::OtherFile
+    }
+
+    /// The page map entry for the page at `offset`.
+    fn pagemap_entry(&mut self, offset: u64) -> io::Result<u64> {
+        let page = offset / Self::PAGE;
+        if page < self.window_start || page >= self.window_start + self.window_len {
+            let first = (self.region.host as u64 + page * Self::PAGE) / Self::PAGE;
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    self.window.as_mut_ptr().cast::<u8>(),
+                    self.window.len() * std::mem::size_of::<u64>(),
+                )
+            };
+            let pages = (self.region.len.div_ceil(Self::PAGE) - page).min(self.window.len() as u64);
+            let wanted = pages as usize * std::mem::size_of::<u64>();
+            let read = self.pagemap.read_at(
+                &mut bytes[..wanted],
+                first * std::mem::size_of::<u64>() as u64,
+            )?;
+            if read < std::mem::size_of::<u64>() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "short read of the guest RAM page map",
+                ));
+            }
+            self.window_start = page;
+            self.window_len = (read / std::mem::size_of::<u64>()) as u64;
+        }
+        Ok(self.window[(page - self.window_start) as usize])
+    }
+
+    /// Whether the page at `offset` can hold data, without touching it: the
+    /// VM has its own copy of it, its backing file has data there, or another
+    /// file is mapped over it.
+    fn may_hold_data(&mut self, offset: u64) -> io::Result<bool> {
+        const PM_PRESENT: u64 = 1 << 63;
+        const PM_SWAP: u64 = 1 << 62;
+        const PM_FILE: u64 = 1 << 61;
+        let segment = self.segment_at(offset);
+        if segment == HeldSegment::OtherFile {
+            return Ok(true);
+        }
+        let entry = self.pagemap_entry(offset)?;
+        if entry & (PM_PRESENT | PM_SWAP) != 0 && entry & PM_FILE == 0 {
+            return Ok(true);
+        }
+        if segment == HeldSegment::Anonymous {
+            // Anonymous memory reads as zero until it is written.
+            return Ok(false);
+        }
+        let Some((file, start)) = &self.region.backing else {
+            // Anonymous memory reads as zero until it is written.
+            return Ok(false);
+        };
+        let at = start + offset;
+        // The last query found no data in [hole_from, data_start) and data
+        // in [data_start, data_end); anything else needs a new query.
+        if !self.extents_known || at < self.hole_from || at >= self.data_end {
+            match next_memory_data_offset(file, at)? {
+                None => {
+                    self.data_start = u64::MAX;
+                    self.data_end = u64::MAX;
+                }
+                Some(data) => {
+                    let end = unsafe {
+                        libc::lseek(file.as_raw_fd(), data as libc::off_t, libc::SEEK_HOLE)
+                    };
+                    if end < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    self.data_start = data;
+                    self.data_end = end as u64;
+                }
+            }
+            self.hole_from = at;
+            self.extents_known = true;
+        }
+        Ok(at >= self.data_start && at < self.data_end)
+    }
+
+    fn read_window(&self, buffer: &mut [u8], offset: u64) {
+        // A device window can hold host file mappings that end mid-page;
+        // read it as another process would, and leave unreadable pages zero.
+        let pid = unsafe { libc::getpid() };
+        let mut done = 0;
+        while done < buffer.len() {
+            let len = (buffer.len() - done).min(Self::PAGE as usize);
+            let local = libc::iovec {
+                iov_base: buffer[done..].as_mut_ptr().cast(),
+                iov_len: len,
+            };
+            let remote = libc::iovec {
+                iov_base: (self.region.host + (offset as usize) + done) as *mut libc::c_void,
+                iov_len: len,
+            };
+            let read = unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) };
+            if read != len as isize {
+                buffer[done..done + len].fill(0);
+            }
+            done += len;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl SparseRamSource for HeldRamSource<'_> {
+    fn len(&self) -> u64 {
+        self.region.len
+    }
+
+    fn next_data(&mut self, offset: u64) -> io::Result<Option<u64>> {
+        let mut page = offset / Self::PAGE * Self::PAGE;
+        while page < self.region.len {
+            if self.may_hold_data(page)? {
+                return Ok(Some(page.max(offset)));
+            }
+            page += Self::PAGE;
+        }
+        Ok(None)
+    }
+
+    fn read_exact_at(&mut self, buffer: &mut [u8], offset: u64) -> io::Result<()> {
+        let end = offset
+            .checked_add(buffer.len() as u64)
+            .filter(|&end| end <= self.region.len)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "read past guest RAM region")
+            })?;
+        let mut at = offset;
+        while at < end {
+            let page_end = ((at / Self::PAGE + 1) * Self::PAGE).min(end);
+            let page = at / Self::PAGE * Self::PAGE;
+            let chunk = &mut buffer[(at - offset) as usize..(page_end - offset) as usize];
+            if !self.may_hold_data(page)? {
+                chunk.fill(0);
+            } else if self.region.device_window || self.segment_at(page) == HeldSegment::OtherFile {
+                self.read_window(chunk, at);
+            } else {
+                // SAFETY: the region is mapped for `len` bytes for as long as
+                // `HeldMemory` holds its guest memory, and the VM is paused.
+                let source = unsafe {
+                    std::slice::from_raw_parts(
+                        (self.region.host + at as usize) as *const u8,
+                        chunk.len(),
+                    )
+                };
+                chunk.copy_from_slice(source);
+            }
+            at = page_end;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl DeferredMemorySave {
     pub(crate) fn from_layered(generation: crate::layered_restore::Generation) -> Self {
@@ -1383,6 +1943,17 @@ impl DeferredMemorySave {
         let (descs, files) = match self.generation {
             DeferredLinuxGeneration::Stable { descs, files } => (descs, files),
             DeferredLinuxGeneration::Copy(copy) => copy.finish()?,
+            DeferredLinuxGeneration::Held(held) => {
+                let regions = held.descs();
+                header(&regions, output)?;
+                if sparse {
+                    held.stream(output)?;
+                } else {
+                    write_memory_stream_header(output, &regions)?;
+                    held.stream_full(output)?;
+                }
+                return Ok(regions);
+            }
             DeferredLinuxGeneration::Layered(generation) => {
                 let regions = generation.memory_regions();
                 header(&regions, output)?;
@@ -1436,6 +2007,10 @@ impl DeferredMemorySave {
             DeferredLinuxGeneration::Layered(generation) => {
                 generation.write_sparse_to(output)?;
                 return Ok(generation.memory_regions());
+            }
+            DeferredLinuxGeneration::Held(held) => {
+                held.write_sparse_to(output)?;
+                return Ok(held.descs());
             }
         };
         if descs.len() != files.len() {
@@ -2611,6 +3186,18 @@ pub fn open_cow_memory_from_pid(
     owner_pid: i32,
     descs: &[MemfdRegionDesc],
 ) -> io::Result<GuestMemoryMmap> {
+    open_cow_memory_from_pid_with_backing(owner_pid, descs).map(|(memory, _)| memory)
+}
+
+/// [`open_cow_memory_from_pid`], also returning per region the owner file it
+/// maps and the offset in it, or `None` for an anonymous region. A held save
+/// uses these to tell never-written pages from pages with data.
+#[cfg(target_os = "linux")]
+#[allow(clippy::type_complexity)]
+pub fn open_cow_memory_from_pid_with_backing(
+    owner_pid: i32,
+    descs: &[MemfdRegionDesc],
+) -> io::Result<(GuestMemoryMmap, Vec<Option<(File, u64)>>)> {
     use std::os::fd::AsRawFd;
     use vm_memory::GuestRegionMmap;
     use vm_memory::mmap::MmapRegion;
@@ -2618,6 +3205,7 @@ pub fn open_cow_memory_from_pid(
     let prot = libc::PROT_READ | libc::PROT_WRITE;
     let io_err = |m: String| io::Error::other(m);
     let mut regions: Vec<GuestRegionMmap> = Vec::with_capacity(descs.len());
+    let mut backing = Vec::with_capacity(descs.len());
 
     for d in descs {
         let size = d.len as usize;
@@ -2642,10 +3230,12 @@ pub fn open_cow_memory_from_pid(
                     d.offset as libc::off_t,
                 )
             };
+            backing.push(Some((file, d.offset)));
             (ptr, flags)
         } else {
             let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
             let ptr = unsafe { libc::mmap(std::ptr::null_mut(), size, prot, flags, -1, 0) };
+            backing.push(None);
             (ptr, flags)
         };
         if ptr == libc::MAP_FAILED {
@@ -2658,7 +3248,9 @@ pub fn open_cow_memory_from_pid(
         regions.push(guest_region);
     }
 
-    GuestMemoryMmap::from_regions(regions).map_err(|e| io_err(format!("from_regions: {e:?}")))
+    let memory = GuestMemoryMmap::from_regions(regions)
+        .map_err(|e| io_err(format!("from_regions: {e:?}")))?;
+    Ok((memory, backing))
 }
 
 /// macOS variant of [`open_cow_memory_from_pid`]: opens each region's backing
@@ -3511,6 +4103,126 @@ mod tests {
             .read_slice(&mut page, GuestAddress(5 * PAGE as u64))
             .unwrap();
         assert_eq!(page, [0; PAGE]);
+    }
+
+    /// Decode a `SMOLRSP1` stream into the full logical image.
+    #[cfg(target_os = "linux")]
+    fn decode_sparse_ram(wire: &[u8]) -> Vec<u8> {
+        assert_eq!(&wire[..8], b"SMOLRSP1");
+        let logical = u64::from_le_bytes(wire[8..16].try_into().unwrap()) as usize;
+        let count = u32::from_le_bytes(wire[16..20].try_into().unwrap()) as usize;
+        let mut ranges = Vec::new();
+        for index in 0..count {
+            let at = 20 + index * 16;
+            let offset = u64::from_le_bytes(wire[at..at + 8].try_into().unwrap()) as usize;
+            let len = u64::from_le_bytes(wire[at + 8..at + 16].try_into().unwrap()) as usize;
+            ranges.push((offset, len));
+        }
+        assert_eq!(ranges.pop(), Some((logical, 0)));
+        let mut image = vec![0_u8; logical];
+        let mut payload = &wire[20 + count * 16..];
+        for (offset, len) in ranges {
+            image[offset..offset + len].copy_from_slice(&payload[..len]);
+            payload = &payload[len..];
+        }
+        assert!(payload.is_empty());
+        image
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn held_save_streams_a_clone_exactly_without_allocating_source_holes() {
+        if run_with_private_address_space(
+            "held_save_streams_a_clone_exactly_without_allocating_source_holes",
+        ) {
+            return;
+        }
+        use crate::builder::create_guest_ram_memfd;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        const PAGE: usize = 4096;
+        const SIZE: usize = 8 * 1024 * 1024;
+        const HIGH_GPA: u64 = 0x100_0000;
+        let source = create_guest_ram_memfd(SIZE).unwrap();
+        source.write_all_at(&[0x11; PAGE], PAGE as u64).unwrap();
+        source.write_all_at(&[0x33; PAGE], 6 * PAGE as u64).unwrap();
+        let descs = [
+            MemfdRegionDesc {
+                gpa: 0,
+                len: SIZE as u64,
+                fd: source.as_raw_fd(),
+                offset: 0,
+                path: String::new(),
+            },
+            MemfdRegionDesc {
+                gpa: HIGH_GPA,
+                len: SIZE as u64,
+                fd: -1,
+                offset: 0,
+                path: String::new(),
+            },
+        ];
+        let (clone, backing) =
+            open_cow_memory_from_pid_with_backing(std::process::id() as i32, &descs).unwrap();
+        // The clone's own copies: over a page with data, over a hole, and in
+        // its anonymous region.
+        clone
+            .write_slice(&[0x22; PAGE], GuestAddress(6 * PAGE as u64))
+            .unwrap();
+        clone
+            .write_slice(&[0x44; PAGE], GuestAddress(9 * PAGE as u64))
+            .unwrap();
+        clone
+            .write_slice(&[0x55; PAGE], GuestAddress(HIGH_GPA + 2 * PAGE as u64))
+            .unwrap();
+        let allocated = source.metadata().unwrap().blocks();
+
+        let valid = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let save = start_held_memory_save(&clone, &backing, None, valid).unwrap();
+        let mut wire = Vec::new();
+        let regions = save.finish_sparse_stream(&mut wire).unwrap();
+
+        assert_eq!(
+            regions,
+            [
+                MemoryRegionDesc {
+                    gpa: 0,
+                    len: SIZE as u64
+                },
+                MemoryRegionDesc {
+                    gpa: HIGH_GPA,
+                    len: SIZE as u64
+                },
+            ]
+        );
+        assert_eq!(
+            source.metadata().unwrap().blocks(),
+            allocated,
+            "the held save allocated unwritten pages of the source RAM file"
+        );
+        let image = decode_sparse_ram(&wire);
+        let mut expected = vec![0_u8; 2 * SIZE];
+        expected[PAGE..2 * PAGE].fill(0x11);
+        expected[6 * PAGE..7 * PAGE].fill(0x22);
+        expected[9 * PAGE..10 * PAGE].fill(0x44);
+        expected[SIZE + 2 * PAGE..SIZE + 3 * PAGE].fill(0x55);
+        assert!(image == expected, "held save image differs from the clone");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn held_save_fails_once_the_vm_resumes() {
+        const SIZE: usize = 2 * 1024 * 1024;
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), SIZE)]).unwrap();
+        memory
+            .write_slice(&[0x11; 4096], GuestAddress(0x1000))
+            .unwrap();
+        let valid = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let save = start_held_memory_save(&memory, &[], None, valid.clone()).unwrap();
+        valid.store(false, std::sync::atomic::Ordering::SeqCst);
+        let error = save.finish_sparse_stream(&mut Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("resumed"), "{error}");
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

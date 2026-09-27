@@ -351,6 +351,12 @@ pub struct Vmm {
     /// newer generation replaces these handles.
     #[cfg(all(target_os = "linux", fork_continue_supported, feature = "blk"))]
     retained_generation_files: Vec<std::fs::File>,
+    /// Per region, the file a restored copy-on-write clone region maps.
+    #[cfg(target_os = "linux")]
+    cow_backing: Vec<Option<(std::fs::File, u64)>>,
+    /// Set while a held save reads the paused RAM; resuming clears it.
+    #[cfg(target_os = "linux")]
+    held_save_valid: Option<Arc<std::sync::atomic::AtomicBool>>,
 
     // Guest VM devices.
     mmio_device_manager: MMIODeviceManager,
@@ -476,6 +482,8 @@ fn paused_vm_with_failed_ram_mapping_cannot_capture_or_rearm() {
         exit_code: Arc::new(AtomicI32::new(i32::MAX)),
         #[cfg(feature = "blk")]
         retained_generation_files: Vec::new(),
+        cow_backing: Vec::new(),
+        held_save_valid: None,
         mmio_device_manager: MMIODeviceManager::new(
             &mut mmio_base,
             (arch::IRQ_BASE, arch::IRQ_MAX),
@@ -1029,6 +1037,27 @@ impl Vmm {
         &mut self,
         generation_dir: &std::path::Path,
     ) -> Result<(VmCheckpoint, snapshot::DeferredMemorySave)> {
+        self.checkpoint_frozen_deferred_sparse_with(generation_dir, false)
+    }
+
+    /// [`Self::checkpoint_frozen_deferred_sparse`] for a caller that keeps the
+    /// VM paused until the save is finished and then stops it. RAM with no
+    /// file generation to retain, such as a fork clone's copy-on-write view,
+    /// is then read in place instead of being refused.
+    #[cfg(all(snapshot_supported, deferred_stream_supported))]
+    pub fn checkpoint_frozen_held_sparse(
+        &mut self,
+        generation_dir: &std::path::Path,
+    ) -> Result<(VmCheckpoint, snapshot::DeferredMemorySave)> {
+        self.checkpoint_frozen_deferred_sparse_with(generation_dir, true)
+    }
+
+    #[cfg(all(snapshot_supported, deferred_stream_supported))]
+    fn checkpoint_frozen_deferred_sparse_with(
+        &mut self,
+        generation_dir: &std::path::Path,
+        held: bool,
+    ) -> Result<(VmCheckpoint, snapshot::DeferredMemorySave)> {
         self.pause()?;
         let capture = (|| {
             self.quiesce_devices()?;
@@ -1045,14 +1074,32 @@ impl Vmm {
             let memory = if let Some(generation) = layered_generation {
                 snapshot::DeferredMemorySave::from_layered(generation)
             } else {
-                snapshot::start_deferred_memory_save_with_windows(
+                match snapshot::start_deferred_memory_save_with_windows(
                     &self.guest_memory,
                     generation_dir,
                     Some(self.device_windows_start()),
-                )
-                .map_err(|error| {
-                    Error::Snapshot(format!("retain COW guest-memory generation: {error}"))
-                })?
+                ) {
+                    Ok(memory) => memory,
+                    Err(error) if held && error.kind() == std::io::ErrorKind::Unsupported => {
+                        let valid = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                        let memory = snapshot::start_held_memory_save(
+                            &self.guest_memory,
+                            &self.cow_backing,
+                            Some(self.device_windows_start()),
+                            Arc::clone(&valid),
+                        )
+                        .map_err(|error| {
+                            Error::Snapshot(format!("hold paused guest memory: {error}"))
+                        })?;
+                        self.held_save_valid = Some(valid);
+                        memory
+                    }
+                    Err(error) => {
+                        return Err(Error::Snapshot(format!(
+                            "retain COW guest-memory generation: {error}"
+                        )));
+                    }
+                }
             };
             #[cfg(not(target_os = "linux"))]
             let memory = snapshot::start_deferred_memory_save(&self.guest_memory, generation_dir)
@@ -1679,6 +1726,12 @@ impl Vmm {
     pub fn resume(&mut self) -> Result<()> {
         #[cfg(target_os = "linux")]
         self.ensure_ram_mapping_valid()?;
+        // A held save reads RAM in place: once the guest runs, that RAM is no
+        // longer the captured image, so the save must fail rather than mix.
+        #[cfg(target_os = "linux")]
+        if let Some(valid) = self.held_save_valid.take() {
+            valid.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
         match self.run_state {
             VmmRunState::Running => Ok(()),
             VmmRunState::Paused | VmmRunState::Pausing => {
