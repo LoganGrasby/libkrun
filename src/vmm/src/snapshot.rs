@@ -3183,10 +3183,16 @@ pub fn memfd_region_descs(mem: &GuestMemoryMmap) -> Vec<MemfdRegionDesc> {
 /// to read it, allocates a zeroed page in the file before the clone gets its
 /// own copy. A clone that uses fresh memory would so fill its source's RAM file
 /// towards the full guest size, charged to the source, and pay several times
-/// the cost of an anonymous fault for each such page. The source is a sealed
-/// generation, so its holes read as zeros for good: anonymous memory there
-/// reads the same, and stays private to the clone. Past `MAX_OVERLAYS` holes
-/// the rest keep the file mapping, which bounds the number of mappings.
+/// the cost of an anonymous fault for each such page. When the source is a
+/// write-sealed generation, its holes read as zeros for good: anonymous memory
+/// there reads the same, and stays private to the clone. A source that is not
+/// sealed, such as a `FORK` base, which can still be resumed, keeps the file
+/// mapping.
+///
+/// Holes smaller than `MIN_HOLE` keep the file mapping too: a copied
+/// generation has hundreds of them, from zero pages the copy skipped, and each
+/// overlay splits the mapping, while together they are a few MiB at most.
+/// Past `MAX_OVERLAYS` holes the rest keep the file mapping as well.
 #[cfg(target_os = "linux")]
 fn map_anonymous_over_holes(
     host: *mut libc::c_void,
@@ -3195,8 +3201,13 @@ fn map_anonymous_over_holes(
     offset: u64,
 ) -> io::Result<()> {
     const PAGE: u64 = 4096;
+    const MIN_HOLE: u64 = 64 * 1024;
     const MAX_OVERLAYS: usize = 1024;
     let fd = file.as_raw_fd();
+    let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+    if seals < 0 || seals & libc::F_SEAL_WRITE == 0 {
+        return Ok(());
+    }
     let end = offset + len as u64;
     let mut cursor = offset;
     let mut overlays = 0;
@@ -3229,7 +3240,7 @@ fn map_anonymous_over_holes(
         };
         let from = hole.next_multiple_of(PAGE);
         let to = data - data % PAGE;
-        if to > from {
+        if to > from && to - from >= MIN_HOLE {
             let address = unsafe { host.cast::<u8>().add((from - offset) as usize) };
             let mapped = unsafe {
                 libc::mmap(
@@ -4304,9 +4315,14 @@ mod tests {
         const PAGE: usize = 4096;
         const SIZE: usize = 8 * 1024 * 1024;
         let source = create_guest_ram_memfd(SIZE).unwrap();
-        // Data, a hole, data, then a large hole.
+        // Data, a hole too small to remap, data, then a large hole.
         source.write_all_at(&[0x11; 2 * PAGE], 0).unwrap();
         source.write_all_at(&[0x33; PAGE], 4 * PAGE as u64).unwrap();
+        let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
+        assert_eq!(
+            unsafe { libc::fcntl(source.as_raw_fd(), libc::F_ADD_SEALS, seals) },
+            0
+        );
         let allocated = source.metadata().unwrap().blocks();
         let descs = [MemfdRegionDesc {
             gpa: 0,
@@ -4338,16 +4354,44 @@ mod tests {
         expected[5 * PAGE..].fill(0x44);
         expected[PAGE..2 * PAGE].fill(0x55);
         assert!(image == expected, "the clone lost its own writes");
+        // Only the small hole, which the clone read through the file mapping.
         assert_eq!(
             source.metadata().unwrap().blocks(),
-            allocated,
+            allocated + (2 * PAGE / 512) as u64,
             "the clone allocated unwritten pages of its source's RAM file"
         );
         let mut data = vec![0_u8; 5 * PAGE];
         source.read_exact_at(&mut data, 0).unwrap();
-        assert!(data[..PAGE].iter().all(|&byte| byte == 0x11));
-        assert!(data[PAGE..2 * PAGE].iter().all(|&byte| byte == 0x11));
+        assert!(data[..2 * PAGE].iter().all(|&byte| byte == 0x11));
+        assert!(data[2 * PAGE..4 * PAGE].iter().all(|&byte| byte == 0));
         assert!(data[4 * PAGE..].iter().all(|&byte| byte == 0x33));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clone_of_an_unsealed_source_keeps_the_file_mapping() {
+        use crate::builder::create_guest_ram_memfd;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        const SIZE: usize = 8 * 1024 * 1024;
+        let source = create_guest_ram_memfd(SIZE).unwrap();
+        source.write_all_at(&[0x11; 4096], 0).unwrap();
+        let allocated = source.metadata().unwrap().blocks();
+        let descs = [MemfdRegionDesc {
+            gpa: 0,
+            len: SIZE as u64,
+            fd: source.as_raw_fd(),
+            offset: 0,
+            path: String::new(),
+        }];
+        let clone = open_cow_memory_from_pid(std::process::id() as i32, &descs).unwrap();
+        // A source that can still change stays visible through its holes.
+        source.write_all_at(&[0x22; 4096], 1 << 20).unwrap();
+        let mut page = [0_u8; 4096];
+        clone.read_slice(&mut page, GuestAddress(1 << 20)).unwrap();
+        assert_eq!(page, [0x22; 4096]);
+        assert!(source.metadata().unwrap().blocks() > allocated);
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
